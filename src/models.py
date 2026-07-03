@@ -48,7 +48,7 @@ class AdaLNZero(nn.Module):
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
-    def forward(self, x, cond):
+    def forward(self, cond):
         # x: [B, N, embed_dim], cond: [B, cond_dim]
         gamma1, beta1, gamma2, beta2, scale1, scale2 = self.linear(cond).chunk(6, dim=-1)
         return (gamma1, beta1, gamma2, beta2, scale1, scale2)
@@ -111,7 +111,7 @@ class DiTBlock(nn.Module):
         # Residual gating apply scale1 parameter
         x = res + s1.unsqueeze(1) * attn_out
         
-        
+
         # --- SwiGLU MLP Track ---
         res = x
         normed_x = self.norm2(x) * (1 + g2.unsqueeze(1)) + b2.unsqueeze(1)

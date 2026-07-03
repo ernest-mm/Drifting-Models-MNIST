@@ -42,7 +42,8 @@ class DriftingLoss(nn.Module):
 
         # 2. Ignore Self-Interaction if y_neg reuses the generated points x (Algorithm 2)
         # Prevents a generated sample from repelling itself with infinite force.
-        if torch.bool_tensor([y_neg.data_ptr() == x.data_ptr()]).item():
+        # CHANGE THIS LINE (Line 45 in src/drifting_loss.py):
+        if torch.tensor([y_neg.data_ptr() == x.data_ptr()], dtype=torch.bool, device=x.device).item():
             dist_neg = dist_neg + torch.eye(N, device=x.device) * 1e6
 
         # 3. Scale by temperature and convert distances to similarity logits

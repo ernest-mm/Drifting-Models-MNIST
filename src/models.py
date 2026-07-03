@@ -91,7 +91,7 @@ class DiTBlock(nn.Module):
         normed_x = self.norm1(x) * (1 + g1.unsqueeze(1)) + b1.unsqueeze(1)
         
         B, N, C = normed_x.shape
-        qkv = self.qkv(normed_x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, B, N, 3, 4)
+        qkv = self.qkv(normed_x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 1, 3, 4)
         q, k, v = qkv[0], qkv[1], qkv[2] # Shapes: [B, N, num_heads, head_dim]
         
         # Apply QK-Norm to stabilize high-dimensional gradient fields

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class DriftingLoss(nn.Module):
     """
@@ -36,13 +37,10 @@ class DriftingLoss(nn.Module):
         N_neg = y_neg.size(0)
 
         # 1. Compute Pairwise Euclidean (L2) Distance Matrices (Equation 12 / Algorithm 2)
-        # dist_pos[i, j] = ||x_i - y_pos_j||
         dist_pos = torch.cdist(x, y_pos, p=2) # Shape: [N, N_pos]
         dist_neg = torch.cdist(x, y_neg, p=2) # Shape: [N, N_neg]
 
         # 2. Ignore Self-Interaction if y_neg reuses the generated points x (Algorithm 2)
-        # Prevents a generated sample from repelling itself with infinite force.
-        # CHANGE THIS LINE (Line 45 in src/drifting_loss.py):
         if torch.tensor([y_neg.data_ptr() == x.data_ptr()], dtype=torch.bool, device=x.device).item():
             dist_neg = dist_neg + torch.eye(N, device=x.device) * 1e6
 
@@ -50,20 +48,18 @@ class DriftingLoss(nn.Module):
         logit_pos = -dist_pos / tau # Shape: [N, N_pos]
         logit_neg = -dist_neg / tau # Shape: [N, N_neg]
 
-        # 4. Concatenate for Joint Normalization (Algorithm 2: logit = cat([logit_pos, logit_neg], dim=1))
+        # 4. Concatenate for Joint Normalization
         logit = torch.cat([logit_pos, logit_neg], dim=1) # Shape: [N, N_pos + N_neg]
 
         # 5. Dual-Dimension Normalization (Paragraph 5 & Algorithm 2)
-        # "We implement k_tilde using a softmax operation... normalized along both dimensions"
-        A_row = F.softmax(logit, dim=-1)   # Normalize over targets (y axis) -> Equation 9 / Z normalization
-        A_col = F.softmax(logit, dim=-2)   # Normalize over sources (x axis) -> Extra stabilization
+        A_row = F.softmax(logit, dim=-1)   # Normalize over targets (y axis)
+        A_col = F.softmax(logit, dim=-2)   # Normalize over sources (x axis)
         A = torch.sqrt(A_row * A_col)      # Jointly geometric mean matrix, Shape: [N, N_pos + N_neg]
 
         # 6. Split the normalized weights back into positive and negative tracks
         A_pos, A_neg = torch.split(A, [N_pos, N_neg], dim=1) # Shapes: [N, N_pos] and [N, N_neg]
 
         # 7. Compute Cross-Mass Weights (Algorithm 2)
-        # W_pos balances the row-wise influence of negatives onto positives and vice-versa
         W_pos = A_pos * A_neg.sum(dim=1, keepdim=True) # Shape: [N, N_pos]
         W_neg = A_neg * A_pos.sum(dim=1, keepdim=True) # Shape: [N, N_neg]
 
@@ -78,38 +74,30 @@ class DriftingLoss(nn.Module):
     def forward(self, x, y_pos):
         """
         Executes the overall multi-temperature, normalized drifting loss step.
-        
-        Args:
-            x: Generated images from network f_theta, shape [B, 1, 28, 28]
-            y_pos: Authentic target images from DataLoader, shape [B, 1, 28, 28]
-            
-        Returns:
-            loss: Scalar Mean Squared Error drifting loss tensor (Equation 26)
+        Adapts seamlessly to both 4D image inputs and 2D flat latent bottleneck spaces.
         """
-        # Save original spatial dimension to rebuild the shape later if needed
-        B, C, H, W = x.shape
-        D = C * H * W
-        
-        # Flatten images to vectors for distance metrics in pixel space
-        x_flat = x.view(B, D)
-        y_pos_flat = y_pos.view(B, D)
-        
-        # Algorithm 1: "The generated samples also serve as the negative samples in the same batch"
+        # Dynamic shape matching to prevent unpacking errors
+        if len(x.shape) == 4:
+            B, C, H, W = x.shape
+            D = C * H * W
+            x_flat = x.view(B, D)
+            y_pos_flat = y_pos.view(B, D)
+        else:
+            B, D = x.shape # Captures [B, 16] straight from the LatentDiT
+            x_flat = x
+            y_pos_flat = y_pos
+            
+        # Algorithm 1: The generated samples serve as negative samples inside the same batch
         y_neg_flat = x_flat 
 
         # --- FEATURE NORMALIZATION (Section A.6, Equations 18-22) ---
-        # "We want to perform normalization such that the kernel k(·,·) and drift V 
-        # are insensitive to the absolute magnitude of features."
-        # For pixel space, dimensionality C_j is D. Target average distance is sqrt(D).
         with torch.no_grad():
-            # Compute raw average pairwise distance across all available batch samples
             all_samples = torch.cat([x_flat, y_pos_flat], dim=0)
             raw_dist = torch.cdist(all_samples, all_samples, p=2)
             mean_raw_dist = raw_dist.mean()
             
             # Equation 21: Normalization Scale S_j
-            S_j = mean_raw_dist / math.sqrt(D) if 'math' in globals() else mean_raw_dist / (D ** 0.5)
-            # Apply stop-gradient to S_j since it acts as a constant scaling factor for the batch
+            S_j = mean_raw_dist / math.sqrt(D)
             S_j = S_j.detach()
 
         # Normalize features by scale S_j (Equation 18)
@@ -122,24 +110,20 @@ class DriftingLoss(nn.Module):
         
         for tau_base in self.temperatures:
             # Equation 22 adjustment: tau_tilde = tau * sqrt(C_j)
-            tau_tilde = tau_base * (D ** 0.5)
+            tau_tilde = tau_base * math.sqrt(D)
             
             # Compute V for this specific temperature threshold
             V_tau = self.compute_V_at_temperature(x_norm, y_pos_norm, y_neg_norm, tau=tau_tilde)
             
-            # Equation 25: Compute Drift Normalization Scale lambda_j for this specific V_tau
+            # Equation 25: Compute Drift Normalization Scale lambda_j
             with torch.no_grad():
-                # lambda_j = sqrt( E[ (1/C_j) * ||V_j||^2 ] )
                 lambda_j = torch.sqrt((V_tau ** 2).sum(dim=-1).mean() / D).detach()
-                # Safeguard against division by zero
                 lambda_j = torch.clamp(lambda_j, min=1e-6)
                 
-            # Equation 23: V_tilde = V / lambda_j. Accumulate into total aggregated field.
+            # Equation 23: V_tilde = V / lambda_j. Accumulate field components.
             V_aggregated += (V_tau / lambda_j)
 
         # --- LOSS COMPUTATION (Equation 26 & Algorithm 1) ---
-        # L_j = MSE( x_tilde - sg(x_tilde + V_tilde) )
-        # Using stop-gradient (sg / .detach()) handles the distribution mechanics correctly.
         x_drifted = (x_norm + V_aggregated).detach()
         loss = F.mse_loss(x_norm, x_drifted)
         

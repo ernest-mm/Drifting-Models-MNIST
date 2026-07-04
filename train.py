@@ -3,9 +3,10 @@ import os
 import torch
 import torch.optim as optim
 from tqdm import tqdm
+import matplotlib.pyplot as plt  # Added for generating the loss curve plot
 
 from src.dataset import get_mnist_loaders
-from src.autoencoder import DigitVAE  # Updated from DigitAutoencoder
+from src.autoencoder import DigitVAE  
 from src.models import LatentDiT
 from src.drifting_loss import DriftingLoss
 from src.utils import save_image_grid
@@ -28,7 +29,7 @@ def main():
     train_loader, _ = get_mnist_loaders(batch_size=args.batch_size)
 
     # 1. Load your frozen feature space encoder
-    ae = DigitVAE(latent_dim=16).to(device)  # Updated from DigitAutoencoder
+    ae = DigitVAE(latent_dim=16).to(device)  
     ae.load_state_dict(torch.load("./checkpoints/autoencoder.pt", map_location=device))
     ae.eval() # Crucial: freeze batchnorm/dropout profiles in the encoder mesh
 
@@ -36,6 +37,9 @@ def main():
     model = LatentDiT(latent_dim=16).to(device)
     criterion = DriftingLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # List to collect structural iteration losses continuously from first step to final step
+    iteration_losses = []
 
     print("[*] Initiating Latent Drifting Model training phase...")
     for epoch in range(1, args.epochs + 1):
@@ -50,10 +54,9 @@ def main():
             
             # Extract target anchor features cleanly using the VAE's mu projection mapping
             with torch.no_grad():
-                y_pos = ae.encode(images)[0]  # Fixed: Extracted mu [0] to resolve the tuple view error
+                y_pos = ae.encode(images)[0]  
             
             # Map clean conditioning vector parameters matching Section 4 conventions
-            # Alpha controls the classifier-free guidance scaling thresholds implicitly
             alpha = torch.randn(B, 1, device=device)
             epsilon = torch.randn(B, 16, device=device)
             
@@ -69,8 +72,12 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
-            running_loss += loss.item()
-            pbar.set_postfix({"Loss": f"{loss.item():.5f}"})
+            # Track current loss tracking elements per-iteration
+            loss_value = loss.item()
+            running_loss += loss_value
+            iteration_losses.append(loss_value)
+            
+            pbar.set_postfix({"Loss": f"{loss_value:.5f}"})
 
         print(f"[=>] Epoch {epoch} Completed. Average Vector Loss: {running_loss/len(train_loader):.5f}")
 
@@ -88,8 +95,24 @@ def main():
                 
                 save_image_grid(pixel_out, f"./outputs/epoch_{epoch}.png", nrow=10)
 
+    # 3. Serialize weights to disk
     torch.save(model.state_dict(), "./checkpoints/drifting_generator_v2.pt")
     print("[+] Training complete. Latent DiT weights saved.")
+
+    # 4. Generate and save the complete visual loss tracking chart
+    print("[*] Compiling global iteration loss chart...")
+    plt.figure(figsize=(10, 5))
+    plt.plot(iteration_losses, label="Drifting Loss", color="chocolate", linewidth=1)
+    plt.title("Drifting Loss Trajectory Per Iteration")
+    plt.xlabel("Global Training Iteration Index")
+    plt.ylabel("Loss Magnitude")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend()
+    
+    chart_output_path = "./outputs/loss_curve.png"
+    plt.savefig(chart_output_path, bbox_inches="tight", dpi=150)
+    plt.close()
+    print(f"[+] Visual performance history charts finalized at: {chart_output_path}")
 
 if __name__ == "__main__":
     main()

@@ -5,7 +5,7 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from src.dataset import get_mnist_loaders
-from src.autoencoder import DigitAutoencoder
+from src.autoencoder import DigitVAE  # Updated from DigitAutoencoder
 from src.models import LatentDiT
 from src.drifting_loss import DriftingLoss
 from src.utils import save_image_grid
@@ -28,36 +28,36 @@ def main():
     train_loader, _ = get_mnist_loaders(batch_size=args.batch_size)
 
     # 1. Load your frozen feature space encoder
-    ae = DigitAutoencoder(latent_dim=16).to(device)
+    ae = DigitVAE(latent_dim=16).to(device)  # Updated from DigitAutoencoder
     ae.load_state_dict(torch.load("./checkpoints/autoencoder.pt", map_location=device))
-    ae.eval()
+    ae.eval() # Crucial: freeze batchnorm/dropout profiles in the encoder mesh
 
-    # 2. Setup Vector DiT and Drift Loss Engine
+    # 2. Instantiate core generation network elements
     model = LatentDiT(latent_dim=16).to(device)
-    criterion = DriftingLoss(temperatures=[0.02, 0.05, 0.2])
+    criterion = DriftingLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    print("[*] Optimizing Drifting Fields in structural latent space...")
+    print("[*] Initiating Latent Drifting Model training phase...")
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
         
-        # Wrapped loop tracker for clean visibility
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
-        for images, labels in pbar:
-            images, labels = images.to(device), labels.to(device)
+        for images, conditioned_labels in pbar:
+            images = images.to(device)
+            conditioned_labels = conditioned_labels.to(device)
             B = images.size(0)
             
-            # Compress real images to target feature destinations
+            # Extract target anchor features cleanly using the VAE's mu projection mapping
             with torch.no_grad():
-                y_pos = ae.encode(images) # [B, 16]
-                
-            alpha = torch.rand(B, 1, device=device) * 3.0 + 1.0
-            drop_mask = torch.rand(B, device=device) < 0.1
-            conditioned_labels = torch.where(drop_mask, torch.tensor(10, device=device), labels)
+                y_pos = ae.encode(images)[0]  # Fixed: Extracted mu [0] to resolve the tuple view error
             
-            # Drift from random latent state coordinates
-            epsilon = torch.randn_like(y_pos)
+            # Map clean conditioning vector parameters matching Section 4 conventions
+            # Alpha controls the classifier-free guidance scaling thresholds implicitly
+            alpha = torch.randn(B, 1, device=device)
+            epsilon = torch.randn(B, 16, device=device)
+            
+            # Predict downstream vector maps from standard Gaussian configurations
             z_predicted = model(epsilon, conditioned_labels, alpha)
             
             loss = criterion(z_predicted, y_pos)
@@ -89,7 +89,7 @@ def main():
                 save_image_grid(pixel_out, f"./outputs/epoch_{epoch}.png", nrow=10)
 
     torch.save(model.state_dict(), "./checkpoints/drifting_generator_v2.pt")
-    print("[+] Training fully updated and verified!")
+    print("[+] Training complete. Latent DiT weights saved.")
 
 if __name__ == "__main__":
     main()

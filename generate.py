@@ -2,7 +2,7 @@ import argparse
 import os
 import torch
 
-from src.autoencoder import DigitAutoencoder
+from src.autoencoder import DigitVAE 
 from src.models import LatentDiT
 from src.utils import save_image_grid
 
@@ -19,7 +19,7 @@ def main():
     print(f"[*] Inference running on device: {device}")
 
     # 2. Load the structural decoder mesh
-    ae = DigitAutoencoder(latent_dim=16).to(device)
+    ae = DigitVAE(latent_dim=16).to(device)  # Updated from DigitAutoencoder
     ae.load_state_dict(torch.load("checkpoints/autoencoder.pt", map_location=device))
     ae.eval()
 
@@ -47,9 +47,9 @@ def main():
 
     # 6. Serialize and save the output matrix grid to disk
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-    nrow = int(args.num_samples ** 0.5) if int(args.num_samples ** 0.5) > 0 else 1
+    nrow = int(args.num_samples ** 0.5) if args.num_samples >= 4 else args.num_samples
     save_image_grid(generated_pixels, args.output_path, nrow=nrow)
-    print(f"[+] Success! Generated image grid exported to: {args.output_path}")
+    print(f"[+] Output image successfully saved to {args.output_path}")
 
 if __name__ == "__main__":
     main()

@@ -2,100 +2,139 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SwiGLU(nn.Module):
-    """
-    SwiGLU activation layer: Swish(x_gate) * x_up
-    """
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
     def forward(self, x):
-        # Expects a tensor split in half along the last dimension
+        norm_x = torch.mean(x * x, dim=-1, keepdim=True)
+        return self.weight * (x * torch.rsqrt(norm_x + self.eps))
+
+
+class SwiGLU(nn.Module):
+    def forward(self, x):
         x, gate = x.chunk(2, dim=-1)
         return x * F.silu(gate)
 
 
 class AdaLNZero(nn.Module):
-    """
-    Implements the adaLN-zero parameter generation tracking mechanism.
-    Predicts scale, shift, and gating parameters from a conditioning vector.
-    """
     def __init__(self, embed_dim):
         super().__init__()
-        # 6 parameters: 2 for Attn (scale/shift), 2 for MLP (scale/shift), 2 for Gating scales
+        # 6 modulation parameters: (gamma1, beta1, alpha1, gamma2, beta2, alpha2)
         self.linear = nn.Linear(embed_dim, 6 * embed_dim)
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
     def forward(self, cond):
-        gamma1, beta1, gamma2, beta2, scale1, scale2 = self.linear(cond).chunk(6, dim=-1)
-        return (gamma1, beta1, gamma2, beta2, scale1, scale2)
+        return self.linear(cond).chunk(6, dim=-1)
+
+
+class QKNormAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        
+        return self.proj(attn_out)
+
+
+class LatentDiTBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.norm1 = RMSNorm(embed_dim)
+        self.attn = QKNormAttention(embed_dim, num_heads)
+        self.norm2 = RMSNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4), 
+            SwiGLU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+        self.adaln = AdaLNZero(embed_dim)
+
+    def forward(self, x, cond):
+        g1, b1, s1, g2, b2, s2 = self.adaln(cond)
+        
+        # 1. Attention Stream with AdaLN modulation
+        # Modulate input sequence features
+        modulated_x = self.norm1(x) * (1 + g1.unsqueeze(1)) + b1.unsqueeze(1)
+        # Apply scaled residual gate connection
+        x = x + s1.unsqueeze(1) * self.attn(modulated_x)
+        
+        # 2. Feed-Forward Stream with AdaLN modulation
+        modulated_x2 = self.norm2(x) * (1 + g2.unsqueeze(1)) + b2.unsqueeze(1)
+        x = x + s2.unsqueeze(1) * self.ffn(modulated_x2)
+        
+        return x
 
 
 class LatentDiT(nn.Module):
-    """
-    A streamlined, vector-space Diffusion Transformer that models 
-    the drifting field explicitly on compressed latent features.
-    """
-    def __init__(self, latent_dim=16, embed_dim=128, num_heads=4, depth=4, num_classes=11):
+    def __init__(self, latent_dim=16, embed_dim=128, num_heads=4, depth=4, num_classes=1000):
         super().__init__()
         
-        # Map our flat size-16 latent vector up to the processing dimensions
         self.input_proj = nn.Linear(latent_dim, embed_dim)
         
-        # Time/Alpha continuous scalar embedder
+        # Standard Conditioning Subsystems
         self.time_embed = nn.Sequential(
             nn.Linear(1, embed_dim),
             nn.SiLU(),
             nn.Linear(embed_dim, embed_dim)
         )
-        
-        # Categorical class identity embedder
         self.class_embed = nn.Embedding(num_classes, embed_dim)
         
-        # Transformer Layer stacks
+        # 16 Static Learnable In-Context Tokens (used as global contextual routing sequence slots)
+        self.num_context_tokens = 16
+        self.context_tokens = nn.Parameter(torch.randn(1, self.num_context_tokens, embed_dim))
+        
         self.blocks = nn.ModuleList([
-            nn.ModuleList([
-                nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6),
-                AdaLNZero(embed_dim),
-                nn.MultiheadAttention(embed_dim, num_heads, batch_first=True),
-                nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6),
-                nn.Sequential(
-                    nn.Linear(embed_dim, embed_dim * 4), # Generates 2x hidden states for the chunk operation
-                    SwiGLU(),
-                    nn.Linear(embed_dim * 2, embed_dim)
-                )
-            ]) for _ in range(depth)
+            LatentDiTBlock(embed_dim, num_heads) for _ in range(depth)
         ])
         
-        self.final_norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        # Output layers matching DiT standards
+        self.final_norm = RMSNorm(embed_dim)
         self.final_adaLN = nn.Sequential(nn.SiLU(), nn.Linear(embed_dim, embed_dim * 2))
         self.output_proj = nn.Linear(embed_dim, latent_dim)
 
     def forward(self, z, labels, alpha):
-        # z: [B, 16] Latent vectors
         B = z.size(0)
         
-        # Project inputs to tokens: treat the dimension as a sequence of length 1
-        x = self.input_proj(z).unsqueeze(1) # [B, 1, embed_dim]
+        # 1. Project base latent vector to sequence space [B, 1, embed_dim]
+        x_data = self.input_proj(z).unsqueeze(1) 
         
-        # Blend class information and alpha guidance context
+        # 2. Compute proper conditioning embedding vector (Time/Alpha + Class)
         cond = self.time_embed(alpha) + self.class_embed(labels) # [B, embed_dim]
         
-        # Pass tokens through your Transformer Blocks
-        for ln1, adaln, mha, ln2, fwd in self.blocks:
-            # 1. Attention Stream
-            g1, b1, g2, b2, s1, s2 = adaln(cond)
-            norm_x = ln1(x)
-            modulated_x = norm_x * (1 + g1.unsqueeze(1)) + b1.unsqueeze(1)
-            attn_out, _ = mha(modulated_x, modulated_x, modulated_x)
-            x = x + s1.unsqueeze(1) * attn_out
-            
-            # 2. Feed-Forward Stream
-            norm_x2 = ln2(x)
-            modulated_x2 = norm_x2 * (1 + g2.unsqueeze(1)) + b2.unsqueeze(1)
-            x = x + s2.unsqueeze(1) * fwd(modulated_x2)
-            
-        # Final prediction scaling back down to latent coordinates
-        x = self.final_norm(x)
-        scale, shift = self.final_adaLN(cond).chunk(2, dim=-1)
-        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        # 3. Form sequence cleanly: prepend learned clean context prefix slots
+        ctx = self.context_tokens.expand(B, -1, -1) 
+        x = torch.cat([ctx, x_data], dim=1) # [B, 17, embed_dim]
         
-        return self.output_proj(x).squeeze(1) # [B, 16]
+        # 4. Global conditioning drives the AdaLN layers across all sequence slots
+        for block in self.blocks:
+            x = block(x, cond)
+            
+        # 5. Squeeze out the target sequence data representation token (the last one)
+        x_data_out = x[:, -1:] 
+        
+        # 6. Apply final normalization and AdaLN scale-shift corrections
+        x_data_out = self.final_norm(x_data_out)
+        scale, shift = self.final_adaLN(cond).chunk(2, dim=-1)
+        x_data_out = x_data_out * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        
+        return self.output_proj(x_data_out).squeeze(1) # Return reconstructed [B, 16] latents

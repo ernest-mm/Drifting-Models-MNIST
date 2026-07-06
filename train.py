@@ -8,7 +8,6 @@ from tqdm import tqdm
 from src.dataset import get_mnist_loaders
 from src.autoencoder import DigitVAE
 from src.models import LatentDiT
-from src.drifting_loss import DriftingLoss
 from src.utils import load_state_dict_any, save_image_grid
 
 def main():
@@ -37,7 +36,6 @@ def main():
     ae.eval()
 
     model = LatentDiT(latent_dim=16).to(device)
-    get_field = DriftingLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     iteration_losses = []
@@ -56,18 +54,15 @@ def main():
             with torch.inference_mode():
                 y_pos = ae.encode(images)[0]
             
-            alpha = torch.rand(B, 1, device=device)
+            strength = torch.rand(B, 1, device=device)
             epsilon = torch.randn(B, 16, device=device)
+            target = y_pos + 0.1 * torch.randn_like(y_pos)
             
-            z_predicted = model(epsilon, conditioned_labels, alpha)
-            
-            V, S_j = get_field(z_predicted, y_pos)
-            
-            z_predicted_norm = z_predicted / S_j
-            
-            z_target_norm = (z_predicted_norm + args.drift_step * V).detach()
-            
-            loss = F.mse_loss(z_predicted_norm, z_target_norm)
+            z_predicted = model(epsilon, conditioned_labels, strength)
+
+            recon_loss = F.mse_loss(z_predicted, target)
+            latent_penalty = 0.01 * z_predicted.pow(2).mean()
+            loss = recon_loss + latent_penalty
             
             optimizer.zero_grad()
             loss.backward()
@@ -79,7 +74,7 @@ def main():
             running_loss += loss_value
             iteration_losses.append(loss_value)
             
-            pbar.set_postfix({"Pushforward_MSE": f"{loss_value:.5f}"})
+            pbar.set_postfix({"latent_mse": f"{recon_loss.item():.5f}"})
 
         print(f"[=>] Epoch {epoch} Completed. Average Pushforward MSE: {running_loss/len(train_loader):.5f}")
 
@@ -87,10 +82,10 @@ def main():
             model.eval()
             with torch.inference_mode():
                 sample_labels = torch.arange(10, device=device).repeat(8)[:64]
-                fixed_alpha = torch.ones(64, 1, device=device) * 2.5
+                fixed_alpha = torch.ones(64, 1, device=device)
                 fixed_noise = torch.randn(64, 16, device=device)
                 
-                latent_out = model(fixed_noise, sample_labels, fixed_alpha)
+                latent_out = model.sample(fixed_noise, sample_labels, fixed_alpha)
                 pixel_out = ae.decode(latent_out)
                 
                 save_image_grid(pixel_out, f"./outputs/epoch_{epoch}.png", nrow=10)

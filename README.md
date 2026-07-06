@@ -18,7 +18,9 @@ python train.py --epochs 30
 ## Generation
 
 ```bash
-python generate.py --digit 7 --num_samples 16 --output_path ./outputs/generated_digits.png
+python generate.py --digit 7 --strength 1.0 --num_samples 16 --output_path ./outputs/generated_digits.png
 ```
 
 Checkpoints are written to `./checkpoints` and image grids to `./outputs`.
+
+If you trained before this rebuild, retrain both stages. The old generator checkpoint was produced with a collapse-prone objective and will not give reliable digit control.

@@ -131,3 +131,6 @@ class LatentDiT(nn.Module):
         x_data_out = x_data_out * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         
         return self.output_proj(x_data_out).squeeze(1)
+
+    def sample(self, noise, labels, strength):
+        return self.forward(noise, labels, strength)

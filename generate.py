@@ -9,7 +9,7 @@ from src.utils import load_state_dict_any, save_image_grid
 def main():
     parser = argparse.ArgumentParser(description="One-Step (1-NFE) Latent Conditional Digit Generation")
     parser.add_argument("--digit", type=int, default=7, choices=list(range(10)), help="The specific digit (0-9) you want to generate")
-    parser.add_argument("--cfg_scale", type=float, default=3.0, help="Classifier-Free Guidance scale (higher = sharper/more strict)")
+    parser.add_argument("--strength", type=float, default=1.0, help="Conditioning strength used during latent sampling")
     parser.add_argument("--num_samples", type=int, default=16, help="Number of images to generate")
     parser.add_argument("--output_path", type=str, default="./outputs/generated_digits.png", help="Path to save the generated image grid")
     args = parser.parse_args()
@@ -34,13 +34,13 @@ def main():
     model.eval()
 
     labels = torch.full((args.num_samples,), args.digit, dtype=torch.long, device=device)
-    alphas = torch.full((args.num_samples, 1), args.cfg_scale, dtype=torch.float, device=device)
+    strengths = torch.full((args.num_samples, 1), args.strength, dtype=torch.float, device=device)
 
-    print(f"[*] Generating {args.num_samples} samples of digit '{args.digit}' with CFG scale {args.cfg_scale}...")
+    print(f"[*] Generating {args.num_samples} samples of digit '{args.digit}' with strength {args.strength}...")
     
     with torch.inference_mode():
         epsilon = torch.randn(args.num_samples, 16, device=device)
-        latent_out = model(epsilon, labels, alphas)
+        latent_out = model.sample(epsilon, labels, strengths)
         generated_pixels = ae.decode(latent_out)
 
     output_dir = os.path.dirname(args.output_path)

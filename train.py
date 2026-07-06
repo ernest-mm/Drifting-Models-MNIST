@@ -4,13 +4,12 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 from src.dataset import get_mnist_loaders
-from src.autoencoder import DigitVAE  
+from src.autoencoder import DigitVAE
 from src.models import LatentDiT
 from src.drifting_loss import DriftingLoss
-from src.utils import save_image_grid
+from src.utils import load_state_dict_any, save_image_grid
 
 def main():
     parser = argparse.ArgumentParser(description="Train a Latent-Space Drifting Model on MNIST")
@@ -23,23 +22,27 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] Utilizing computation device: {device}")
-    
+
     os.makedirs("./outputs", exist_ok=True)
     os.makedirs("./checkpoints", exist_ok=True)
 
     train_loader, _ = get_mnist_loaders(batch_size=args.batch_size)
 
-    ae = DigitVAE(latent_dim=16).to(device)  
-    ae.load_state_dict(torch.load("./checkpoints/autoencoder.pt", map_location=device))
-    ae.eval() 
+    ae_path = "./checkpoints/autoencoder.pt"
+    if not os.path.exists(ae_path):
+        raise FileNotFoundError("Autoencoder checkpoint not found. Run train_ae.py first.")
+
+    ae = DigitVAE(latent_dim=16).to(device)
+    ae.load_state_dict(load_state_dict_any(ae_path, map_location=device))
+    ae.eval()
 
     model = LatentDiT(latent_dim=16).to(device)
-    get_field = DriftingLoss() 
+    get_field = DriftingLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     iteration_losses = []
 
-    print("[*] Initiating Latent Drifting Model training phase...")
+    print("[*] Initiating latent drifting model training phase...")
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -50,26 +53,20 @@ def main():
             conditioned_labels = conditioned_labels.to(device)
             B = images.size(0)
             
-            with torch.no_grad():
-                y_pos = ae.encode(images)[0]  
+            with torch.inference_mode():
+                y_pos = ae.encode(images)[0]
             
-            alpha = torch.randn(B, 1, device=device)
+            alpha = torch.rand(B, 1, device=device)
             epsilon = torch.randn(B, 16, device=device)
             
-            # 1. Predict downstream latent coordinates
             z_predicted = model(epsilon, conditioned_labels, alpha)
             
-            # 2. Extract the raw structural field vectors and feature scale factor S_j
-            # Note: Ensure your drifting_loss.py forward function returns (V_final, S_j)
             V, S_j = get_field(z_predicted, y_pos)
             
-            # 3. Project to the mathematically required normalized space
             z_predicted_norm = z_predicted / S_j
             
-            # 4. Create the detached pushforward target inside normalized space
             z_target_norm = (z_predicted_norm + args.drift_step * V).detach()
             
-            # 5. Calculate the Mean Squared Error tracking matching Algorithm 1
             loss = F.mse_loss(z_predicted_norm, z_target_norm)
             
             optimizer.zero_grad()
@@ -88,7 +85,7 @@ def main():
 
         if epoch % 5 == 0 or epoch == 1:
             model.eval()
-            with torch.no_grad():
+            with torch.inference_mode():
                 sample_labels = torch.arange(10, device=device).repeat(8)[:64]
                 fixed_alpha = torch.ones(64, 1, device=device) * 2.5
                 fixed_noise = torch.randn(64, 16, device=device)
@@ -101,19 +98,12 @@ def main():
     torch.save(model.state_dict(), "./checkpoints/drifting_generator_v2.pt")
     print("[+] Training complete. Latent DiT weights saved.")
 
-    # Generate and save the visual loss tracking chart
-    plt.figure(figsize=(10, 5))
-    plt.plot(iteration_losses, label="Pushforward MSE", color="royalblue", linewidth=1)
-    plt.title("Pushforward Optimization Trajectory Per Iteration")
-    plt.xlabel("Global Training Iteration Index")
-    plt.ylabel("MSE Loss Magnitude")
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.legend()
-    
-    chart_output_path = "./outputs/loss_curve.png"
-    plt.savefig(chart_output_path, bbox_inches="tight", dpi=150)
-    plt.close()
-    print(f"[+] Performance charts finalized at: {chart_output_path}")
+    loss_curve_path = "./outputs/loss_curve.csv"
+    with open(loss_curve_path, "w", encoding="utf-8") as handle:
+        handle.write("iteration,loss\n")
+        for index, value in enumerate(iteration_losses, start=1):
+            handle.write(f"{index},{value:.8f}\n")
+    print(f"[+] Performance log finalized at: {loss_curve_path}")
 
 if __name__ == "__main__":
     main()

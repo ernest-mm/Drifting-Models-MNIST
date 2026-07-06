@@ -2,6 +2,17 @@ import torch
 import torchvision
 import os
 
+
+def load_state_dict_any(path, map_location="cpu"):
+    state = torch.load(path, map_location=map_location)
+
+    if isinstance(state, dict):
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in state:
+                return state[key]
+
+    return state
+
 def save_image_grid(tensor_batch, fp, nrow=8):
     """
     Takes a raw batch of generated or data image tensors, denormalizes them 
@@ -61,13 +72,16 @@ class CheckpointManager:
             return 0
             
         state = torch.load(path, map_location=device)
-        
-        # Unwrap model if it's wrapped in a parallel container
         model_to_load = model.module if hasattr(model, 'module') else model
-        model_to_load.load_state_dict(state['model_state_dict'])
-        
-        if optimizer is not None and 'optimizer_state_dict' in state:
-            optimizer.load_state_dict(state['optimizer_state_dict'])
-            
-        print(f"[*] Checkpoint loaded from: {path} (Resuming from Epoch {state['epoch']})")
-        return state['epoch']
+
+        if isinstance(state, dict) and 'model_state_dict' in state:
+            model_to_load.load_state_dict(state['model_state_dict'])
+            if optimizer is not None and 'optimizer_state_dict' in state:
+                optimizer.load_state_dict(state['optimizer_state_dict'])
+            epoch = state.get('epoch', 0)
+        else:
+            model_to_load.load_state_dict(state)
+            epoch = 0
+
+        print(f"[*] Checkpoint loaded from: {path} (Resuming from Epoch {epoch})")
+        return epoch

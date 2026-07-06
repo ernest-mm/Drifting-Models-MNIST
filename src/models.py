@@ -86,55 +86,48 @@ class LatentDiTBlock(nn.Module):
 
 
 class LatentDiT(nn.Module):
-    def __init__(self, latent_dim=16, embed_dim=128, num_heads=4, depth=4, num_classes=1000):
+    def __init__(self, latent_dim=16, embed_dim=128, num_heads=4, depth=4, num_classes=10):
         super().__init__()
         
         self.input_proj = nn.Linear(latent_dim, embed_dim)
-        
-        # Standard Conditioning Subsystems
         self.time_embed = nn.Sequential(
             nn.Linear(1, embed_dim),
             nn.SiLU(),
             nn.Linear(embed_dim, embed_dim)
         )
         self.class_embed = nn.Embedding(num_classes, embed_dim)
-        
-        # 16 Static Learnable In-Context Tokens (used as global contextual routing sequence slots)
+
         self.num_context_tokens = 16
         self.context_tokens = nn.Parameter(torch.randn(1, self.num_context_tokens, embed_dim))
         
         self.blocks = nn.ModuleList([
             LatentDiTBlock(embed_dim, num_heads) for _ in range(depth)
         ])
-        
-        # Output layers matching DiT standards
+
         self.final_norm = RMSNorm(embed_dim)
         self.final_adaLN = nn.Sequential(nn.SiLU(), nn.Linear(embed_dim, embed_dim * 2))
         self.output_proj = nn.Linear(embed_dim, latent_dim)
 
     def forward(self, z, labels, alpha):
         B = z.size(0)
-        
-        # 1. Project base latent vector to sequence space [B, 1, embed_dim]
-        x_data = self.input_proj(z).unsqueeze(1) 
-        
-        # 2. Compute proper conditioning embedding vector (Time/Alpha + Class)
-        cond = self.time_embed(alpha) + self.class_embed(labels) # [B, embed_dim]
-        
-        # 3. Form sequence cleanly: prepend learned clean context prefix slots
-        ctx = self.context_tokens.expand(B, -1, -1) 
-        x = torch.cat([ctx, x_data], dim=1) # [B, 17, embed_dim]
-        
-        # 4. Global conditioning drives the AdaLN layers across all sequence slots
+
+        if alpha.dim() == 1:
+            alpha = alpha.unsqueeze(-1)
+        alpha = alpha.to(z.dtype)
+        labels = labels.long()
+
+        x_data = self.input_proj(z).unsqueeze(1)
+        cond = self.time_embed(alpha) + self.class_embed(labels)
+
+        ctx = self.context_tokens.expand(B, -1, -1)
+        x = torch.cat([ctx, x_data], dim=1)
+
         for block in self.blocks:
             x = block(x, cond)
-            
-        # 5. Squeeze out the target sequence data representation token (the last one)
-        x_data_out = x[:, -1:] 
-        
-        # 6. Apply final normalization and AdaLN scale-shift corrections
+
+        x_data_out = x[:, -1:]
         x_data_out = self.final_norm(x_data_out)
         scale, shift = self.final_adaLN(cond).chunk(2, dim=-1)
         x_data_out = x_data_out * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         
-        return self.output_proj(x_data_out).squeeze(1) # Return reconstructed [B, 16] latents
+        return self.output_proj(x_data_out).squeeze(1)

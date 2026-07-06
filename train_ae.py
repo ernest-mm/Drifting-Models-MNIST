@@ -1,47 +1,43 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tqdm import tqdm
+
 from src.dataset import get_mnist_loaders
 from src.autoencoder import DigitVAE
 import os
+from src.utils import save_image_grid
 
 def train_ae():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Using a slightly lower batch size for more frequent gradient updates
     train_loader, _ = get_mnist_loaders(batch_size=128)
     
     model = DigitVAE(latent_dim=16).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    
-    # Target weight for the KL Divergence term
-    target_beta = 0.01  
+
+    target_beta = 0.01
     total_epochs = 15
-    
-    print(f"[*] Pre-training Variational Autoencoder with KL-Annealing ({total_epochs} Epochs)...")
-    model.train()
+
+    print(f"[*] Pre-training Variational Autoencoder with KL annealing ({total_epochs} epochs)...")
     for epoch in range(1, total_epochs + 1):
-        # Linear KL Warmup: Gradually scale beta from 0 to target_beta over the first 8 epochs
-        # This prevents early posterior collapse and yields distinct continuous manifolds
         beta = min(target_beta, target_beta * (epoch / 8.0))
         
         total_loss = 0.0
         total_recon = 0.0
         total_kl = 0.0
         
-        for x, _ in train_loader:
+        model.train()
+        progress = tqdm(train_loader, desc=f"AE Epoch {epoch}/{total_epochs}")
+        for x, _ in progress:
             x = x.to(device)
             
             reconstruction, mu, logvar = model(x)
             
-            # 1. Reconstruction Loss
             recon_loss = F.mse_loss(reconstruction, x, reduction='mean')
             
-            # 2. KL Divergence Loss
             kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            kl_loss = kl_loss / x.size(0) 
+            kl_loss = kl_loss / x.size(0)
             
-            # Combined Objective
             loss = recon_loss + beta * kl_loss
             
             optimizer.zero_grad()
@@ -51,6 +47,7 @@ def train_ae():
             total_loss += loss.item() * x.size(0)
             total_recon += recon_loss.item() * x.size(0)
             total_kl += kl_loss.item() * x.size(0)
+            progress.set_postfix({"loss": f"{loss.item():.4f}"})
             
         dataset_size = len(train_loader.dataset)
         print(f"    Epoch {epoch:02d}/{total_epochs} | "
@@ -62,6 +59,13 @@ def train_ae():
     os.makedirs("./checkpoints", exist_ok=True)
     torch.save(model.state_dict(), "./checkpoints/autoencoder.pt")
     print("[+] Continuous variational latent bottleneck weights saved successfully.")
+
+    model.eval()
+    with torch.no_grad():
+        samples, _ = next(iter(train_loader))
+        samples = samples[:64].to(device)
+        reconstructions, _, _ = model(samples)
+        save_image_grid(reconstructions, "./outputs/autoencoder_reconstructions.png", nrow=8)
 
 if __name__ == "__main__":
     train_ae()

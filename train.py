@@ -9,6 +9,7 @@ from src.dataset import get_mnist_loaders
 from src.autoencoder import DigitVAE
 from src.models import LatentDiT
 from src.utils import load_state_dict_any, save_image_grid
+from drifting_loss import DriftingLoss
 
 def main():
     parser = argparse.ArgumentParser(description="Train a Latent-Space Drifting Model on MNIST")
@@ -16,7 +17,6 @@ def main():
     parser.add_argument("--epochs", type=int, default=30, help="Total number of training epochs")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for AdamW optimizer")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for regularization")
-    parser.add_argument("--drift_step", type=float, default=1.0, help="Step size along the drift field vector")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -27,6 +27,7 @@ def main():
 
     train_loader, _ = get_mnist_loaders(batch_size=args.batch_size)
 
+    # 1. Load Frozen Autoencoder Encoder/Decoder
     ae_path = "./checkpoints/autoencoder.pt"
     if not os.path.exists(ae_path):
         raise FileNotFoundError("Autoencoder checkpoint not found. Run train_ae.py first.")
@@ -34,9 +35,13 @@ def main():
     ae = DigitVAE(latent_dim=16).to(device)
     ae.load_state_dict(load_state_dict_any(ae_path, map_location=device))
     ae.eval()
+    for param in ae.parameters():
+        param.requires_grad = False
 
+    # 2. Generator & Loss Setup
     model = LatentDiT(latent_dim=16).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    drifting_criterion = DriftingLoss(temperatures=(0.05, 0.1, 0.2))
 
     iteration_losses = []
 
@@ -51,19 +56,27 @@ def main():
             conditioned_labels = conditioned_labels.to(device)
             B = images.size(0)
             
-            with torch.inference_mode():
-                y_pos = ae.encode(images)[0]
-            
-            strength = torch.rand(B, 1, device=device)
+            # Encode real images into latent space
+            with torch.no_grad():
+                y_pos, _ = ae.encode(images)
+                y_pos = y_pos.detach()
+
+            strength = torch.ones(B, 1, device=device)
             epsilon = torch.randn(B, 16, device=device)
-            target = y_pos + 0.1 * torch.randn_like(y_pos)
             
+            # Predict generated latents
             z_predicted = model(epsilon, conditioned_labels, strength)
 
-            recon_loss = F.mse_loss(z_predicted, target)
-            latent_penalty = 0.01 * z_predicted.pow(2).mean()
-            loss = recon_loss + latent_penalty
-            
+            # Compute Drifting Field V on detached latents
+            with torch.no_grad():
+                V = drifting_criterion(z_predicted.detach(), y_pos)
+
+            # Construct Stop-Gradient Target (Paper Eq. 5 & 6)
+            target = (z_predicted.detach() + V).detach()
+
+            # Optimize Generator towards Target
+            loss = F.mse_loss(z_predicted, target)
+
             optimizer.zero_grad()
             loss.backward()
             
@@ -74,9 +87,9 @@ def main():
             running_loss += loss_value
             iteration_losses.append(loss_value)
             
-            pbar.set_postfix({"latent_mse": f"{recon_loss.item():.5f}"})
+            pbar.set_postfix({"drift_loss": f"{loss_value:.6f}"})
 
-        print(f"[=>] Epoch {epoch} Completed. Average Pushforward MSE: {running_loss/len(train_loader):.5f}")
+        print(f"[=>] Epoch {epoch} Completed. Average Drift Loss: {running_loss/len(train_loader):.6f}")
 
         if epoch % 5 == 0 or epoch == 1:
             model.eval()
@@ -92,13 +105,6 @@ def main():
 
     torch.save(model.state_dict(), "./checkpoints/drifting_generator_v2.pt")
     print("[+] Training complete. Latent DiT weights saved.")
-
-    loss_curve_path = "./outputs/loss_curve.csv"
-    with open(loss_curve_path, "w", encoding="utf-8") as handle:
-        handle.write("iteration,loss\n")
-        for index, value in enumerate(iteration_losses, start=1):
-            handle.write(f"{index},{value:.8f}\n")
-    print(f"[+] Performance log finalized at: {loss_curve_path}")
 
 if __name__ == "__main__":
     main()

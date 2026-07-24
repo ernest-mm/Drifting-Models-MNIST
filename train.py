@@ -9,7 +9,7 @@ from src.dataset import get_mnist_loaders
 from src.autoencoder import DigitVAE
 from src.models import LatentDiT
 from src.utils import load_state_dict_any, save_image_grid
-from drifting_loss import DriftingLoss
+from src.drifting_loss import DriftingLoss
 
 def main():
     parser = argparse.ArgumentParser(description="Train a Latent-Space Drifting Model on MNIST")
